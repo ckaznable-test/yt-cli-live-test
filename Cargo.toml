@@ -6,6 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+byteorder = "1.4.3"
+ffmpeg-next = { version = "6.0.0", features = ["build-lib-fdk-aac"] }
+wait-timeout = "0.2.0"
+whisper-rs = { git = "https://github.com/tazz4843/whisper-rs.git", branch = "master" }
 
 
 [profile.release]
