@@ -1,12 +1,6 @@
-extern crate ffmpeg_next as ffmpeg;
 
-use byteorder::{LittleEndian, ByteOrder};
-use ffmpeg::{ChannelLayout, decoder, codec, Packet};
-use ffmpeg::format::Sample;
-use ffmpeg::frame::Audio;
-use ffmpeg::software::resampling::{context::Context as ResampleContext};
-
-use std::{io::{BufRead, BufReader}, process::{Command, Stdio}, time::{Instant, Duration}};
+use mpeg2ts::{ts::{TsPacketReader, ReadTsPacket, TsPayload}, es::StreamType};
+use std::{io::{BufRead, BufReader, Cursor, Write}, process::{Command, Stdio}, time::{Instant, Duration}, fs::File};
 use wait_timeout::ChildExt;
 use whisper_rs::{WhisperContext, FullParams, SamplingStrategy, WhisperState};
 
@@ -16,10 +10,9 @@ fn main() -> std::io::Result<()> {
 }
 
 fn run_yt() -> std::io::Result<()> {
-    ffmpeg::init().unwrap();
-
     let mut cmd = Command::new("yt-dlp");
-    cmd.arg("https://www.youtube.com/watch?v=RXJjd1KIC7k")
+    const URL: &str = "https://www.youtube.com/watch?v=-5OCkK_yIDc";
+    cmd.arg(URL)
         .args(["-f", "w"])
         .args(["--quiet"])
         .args(["-o", "-"]);
@@ -33,12 +26,12 @@ fn run_yt() -> std::io::Result<()> {
     let mut buffer: Vec<u8> = vec![];
 
     let mut last_processed = Instant::now();
-    let target_time = Duration::from_secs(5);
+    let target_time = Duration::from_secs(10);
 
     // load a context and model
-    let ctx = WhisperContext::new("./ggml-base.bin").expect("failed to load model");
+    // let ctx = WhisperContext::new("./ggml-tiny.bin").expect("failed to load model");
     // make a state
-    let state = ctx.create_state().expect("failed to create state");
+    // let state = ctx.create_state().expect("failed to create state");
 
     loop {
         let buf = reader.fill_buf()?;
@@ -50,20 +43,21 @@ fn run_yt() -> std::io::Result<()> {
         buffer.extend_from_slice(buf);
 
         if last_processed.elapsed() >= target_time {
-            let audio_data = buffer.to_vec();
-            buffer.clear();
-            process(&ctx, &state, audio_data).expect("failed to process");
+            get_ts_audio(&buffer);
+            // process(&ctx, &state, audio_data).expect("failed to process");
             last_processed = Instant::now();
+            buffer.clear();
         }
 
         reader.consume(len);
     }
 
     if !buffer.is_empty() {
-        process(&ctx, &state, buffer.to_vec()).expect("failed to process");
+        // process(&ctx, &state, buffer.to_vec()).expect("failed to process");
+        get_ts_audio(&buffer);
     }
 
-    child.wait_timeout(Duration::from_secs(5)).expect("failed to wait on yt-dlp");
+    child.wait_timeout(Duration::from_secs(3)).expect("failed to wait on yt-dlp");
     Ok(())
 }
 
@@ -90,52 +84,54 @@ fn get_params<'a, 'b>() -> FullParams<'a, 'b> {
     params
 }
 
-fn get_audio_from_ffmpeg(raw: &[u8]) -> Option<Vec<f32>> {
-    let mut decoder = decoder::new()
-        .open_as(decoder::find(codec::Id::H264))
-        .unwrap()
-        .audio()
-        .unwrap();
+fn get_ts_audio(raw: &[u8]) -> Vec<u8> {
+    let cursor = Cursor::new(raw);
+    let mut reader = TsPacketReader::new(cursor);
 
-    let mut resample_context = ResampleContext::get(
-        decoder.format(),
-        decoder.channel_layout(),
-        decoder.rate(),
-        Sample::F32(ffmpeg::format::sample::Type::Packed),
-        ChannelLayout::MONO,
-        decoder.rate(),
-    ).unwrap();
+    let mut data: Vec<u8> = vec![];
+    let mut audio_pid: u16 = 0;
 
-    let packet = Packet::copy(raw);
-    decoder.send_packet(&packet).unwrap();
+    while let Ok(Some(packet)) = reader.read_ts_packet() {
+        use TsPayload::*;
 
-    let mut audio = Audio::empty();
-    let mut audio_converted = Audio::empty();
-    if decoder.receive_frame(&mut audio).is_ok() {
-        resample_context.run(&audio, &mut audio_converted).unwrap();
+        let pid = packet.header.pid.as_u16();
+        let is_audio_pid = pid == audio_pid;
 
-        let mut data: Vec<u8> = vec![];
-        for i in 0..audio_converted.samples() {
-            data.extend_from_slice(audio_converted.data(i));
+        if let Some(payload) = packet.payload {
+            match payload {
+                Pmt(pmt) => {
+                    if let Some(el) = pmt.table.iter().find(|el| el.stream_type == StreamType::AdtsAac) {
+                        audio_pid = el.elementary_pid.as_u16();
+                    }
+                }
+                Pes(pes) => {
+                    if pes.header.stream_id.is_audio() && is_audio_pid {
+                        data.extend_from_slice(&pes.data);
+                    }
+                }
+                Raw(bytes) => {
+                    if is_audio_pid {
+                        data.extend_from_slice(&bytes);
+                    }
+                },
+                _ => (),
+            }
         }
-
-        Some(convert_u8_to_f32(&data))
-    } else {
-        None
     }
+
+    // let mut file = File::create("example.aac").unwrap(); // 創建檔案
+    // file.write_all(&data).unwrap();
+    println!("done");
+    data
 }
 
-fn convert_u8_to_f32(input: &[u8]) -> Vec<f32> {
-    let mut output = vec![0.0; input.len() / 4];
-    for (i, chunk) in input.chunks(4).enumerate() {
-        output[i] = LittleEndian::read_f32(chunk);
-    }
-    output
+fn get_mono_f32(raw: &[u8]) -> Vec<f32> {
+    vec![]
 }
 
 fn process(ctx: &WhisperContext, state: &WhisperState, audio_data: Vec<u8>) -> Result<(), &'static str> {
     let params = get_params();
-    let audio_data = get_audio_from_ffmpeg(&audio_data).unwrap();
+    let audio_data = get_mono_f32(&audio_data);
 
     // now we can run the model
     // note the key we use here is the one we created above

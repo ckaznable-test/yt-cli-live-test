@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 byteorder = "1.4.3"
-ffmpeg-next = { version = "6.0.0", features = ["build-lib-fdk-aac"] }
+mpeg2ts = "0.2"
 wait-timeout = "0.2.0"
 whisper-rs = { git = "https://github.com/tazz4843/whisper-rs.git", branch = "master" }
 
