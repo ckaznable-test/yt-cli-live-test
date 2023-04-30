@@ -1,6 +1,7 @@
 
 use mpeg2ts::{ts::{TsPacketReader, ReadTsPacket, TsPayload}, es::StreamType};
-use std::{io::{BufRead, BufReader, Cursor, Write}, process::{Command, Stdio}, time::{Instant, Duration}, fs::File};
+use symphonia::core::{io::MediaSourceStream, probe::Hint, meta::MetadataOptions, formats::FormatOptions, codecs::{DecoderOptions, CODEC_TYPE_NULL}, errors::Error, audio::AudioBuffer};
+use std::{io::{BufRead, BufReader, Cursor}, process::{Command, Stdio}, time::{Instant, Duration}};
 use wait_timeout::ChildExt;
 use whisper_rs::{WhisperContext, FullParams, SamplingStrategy, WhisperState};
 
@@ -11,7 +12,7 @@ fn main() -> std::io::Result<()> {
 
 fn run_yt() -> std::io::Result<()> {
     let mut cmd = Command::new("yt-dlp");
-    const URL: &str = "https://www.youtube.com/watch?v=-5OCkK_yIDc";
+    const URL: &str = "https://www.youtube.com/watch?v=_WtAKwsdxaY";
     cmd.arg(URL)
         .args(["-f", "w"])
         .args(["--quiet"])
@@ -26,12 +27,12 @@ fn run_yt() -> std::io::Result<()> {
     let mut buffer: Vec<u8> = vec![];
 
     let mut last_processed = Instant::now();
-    let target_time = Duration::from_secs(10);
+    let target_time = Duration::from_secs(5);
 
     // load a context and model
-    // let ctx = WhisperContext::new("./ggml-tiny.bin").expect("failed to load model");
+    let ctx = WhisperContext::new("./ggml-tiny.bin").expect("failed to load model");
     // make a state
-    // let state = ctx.create_state().expect("failed to create state");
+    let state = ctx.create_state().expect("failed to create state");
 
     loop {
         let buf = reader.fill_buf()?;
@@ -43,8 +44,7 @@ fn run_yt() -> std::io::Result<()> {
         buffer.extend_from_slice(buf);
 
         if last_processed.elapsed() >= target_time {
-            get_ts_audio(&buffer);
-            // process(&ctx, &state, audio_data).expect("failed to process");
+            process(&ctx, &state, &buffer).expect("failed to process");
             last_processed = Instant::now();
             buffer.clear();
         }
@@ -53,8 +53,7 @@ fn run_yt() -> std::io::Result<()> {
     }
 
     if !buffer.is_empty() {
-        // process(&ctx, &state, buffer.to_vec()).expect("failed to process");
-        get_ts_audio(&buffer);
+        process(&ctx, &state, &buffer).expect("failed to process");
     }
 
     child.wait_timeout(Duration::from_secs(3)).expect("failed to wait on yt-dlp");
@@ -119,19 +118,95 @@ fn get_ts_audio(raw: &[u8]) -> Vec<u8> {
         }
     }
 
-    // let mut file = File::create("example.aac").unwrap(); // 創建檔案
-    // file.write_all(&data).unwrap();
-    println!("done");
     data
 }
 
-fn get_mono_f32(raw: &[u8]) -> Vec<f32> {
-    vec![]
+fn get_mono_f32(raw: Vec<u8>) -> Vec<f32> {
+    let src = Cursor::new(raw);
+    // Create the media source stream.
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    // Create a probe hint using the file's extension. [Optional]
+    let mut hint = Hint::new();
+    hint.with_extension("aac");
+
+    // Use the default options for metadata and format readers.
+    let meta_opts: MetadataOptions = Default::default();
+    let fmt_opts: FormatOptions = Default::default();
+    let dec_opts: DecoderOptions = Default::default();
+
+    // Probe the media source.
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &fmt_opts, &meta_opts)
+        .expect("unsupported format");
+
+    // Get the instantiated format reader.
+    let mut format = probed.format;
+
+    // Find the first audio track with a known (decodeable) codec.
+    let track = format.tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .expect("no supported audio tracks");
+
+    // Create a decoder for the track.
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &dec_opts)
+        .expect("unsupported codec");
+
+    // Store the track identifier, it will be used to filter packets.
+    let track_id = track.id;
+
+    let mut data: Vec<f32> = vec![];
+
+    // The decode loop.
+    loop {
+        // Get the next packet from the media format.
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(Error::ResetRequired) => {
+                unimplemented!();
+            }
+            Err(_) => {
+                break;
+            }
+        };
+
+        // Consume any new metadata that has been read since the last packet.
+        while !format.metadata().is_latest() {
+            // Pop the old head of the metadata queue.
+            format.metadata().pop();
+        }
+
+        // If the packet does not belong to the selected track, skip over it.
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        // Decode the packet into audio samples.
+        match decoder.decode(&packet) {
+            Ok(audio_buf) => {
+                let mut buf = AudioBuffer::<f32>::new(packet.dur, *audio_buf.spec());
+                audio_buf.convert(&mut buf);
+
+                let planes = buf.planes();
+                let planes = planes.planes();
+                data.extend_from_slice(planes[0]);
+            }
+            Err(Error::DecodeError(_)) => (),
+            _ => {
+                break;
+            }
+        }
+    }
+
+    data
 }
 
-fn process(ctx: &WhisperContext, state: &WhisperState, audio_data: Vec<u8>) -> Result<(), &'static str> {
+fn process(ctx: &WhisperContext, state: &WhisperState, audio_data: &[u8]) -> Result<(), &'static str> {
     let params = get_params();
-    let audio_data = get_mono_f32(&audio_data);
+    let audio_data = get_mono_f32(
+        get_ts_audio(audio_data)
+    );
 
     // now we can run the model
     // note the key we use here is the one we created above
